@@ -119,7 +119,7 @@ static NSString * const kBootJS = @"(function(){"
 @"console.log('[GLQX] read fail '+url+' '+e);"
 @"orig(url);});"
 @"}catch(e){console.log('[GLQX] loadLib err '+e);try{orig(url);}catch(_){}}};"
-@"w.loadLib=fn;w.require=fn;"
+@"w.loadLib=fn;"
 @"console.log('[GLQX] loadLib wrapped');"
 @"}"
 @"wrapLoad();"
@@ -229,13 +229,30 @@ static void mx_install_hooks(void) {
     mlog(@"-[conchRuntime update] hooked");
 }
 
-#pragma mark - 触摸穿透根视图
+#pragma mark - 触摸穿透根视图（v1.1: pointInside 底层拦截 + 自诊断）
+// 机制：window.hitTest 的第一步就是调 root 的 pointInside。
+// 这里只让"落在可交互子控件上"的点命中，其余一律 NO → window.hitTest 返回 nil →
+// 事件由 UIKit 继续分发给下层游戏 window（delegate.window）。比 hitTest==self 判断更底层、无语义差异。
 @interface MXPassthroughView : UIView
 @end
 @implementation MXPassthroughView
+- (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e {
+    static int s_dbg = 0;
+    BOOL hit = NO;
+    for (UIView *v in self.subviews) {
+        if (v.hidden || !v.userInteractionEnabled) continue;
+        CGPoint lp = [self convertPoint:p toView:v];
+        if ([v pointInside:lp withEvent:e]) { hit = YES; break; }
+    }
+    if (++s_dbg <= 25) {
+        mlog(@"pointInside(%.0f,%.0f) -> %@ (subs=%lu)", p.x, p.y, hit ? @"YES" : @"no", (unsigned long)self.subviews.count);
+    }
+    return hit;
+}
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    UIView *hit = [super hitTest:p withEvent:e];
-    return (hit == self) ? nil : hit;   // 空白区穿透游戏
+    // pointInside=NO 时 UIKit 根本不会进到这里；此函数仅防越权子视图
+    if (![self pointInside:p withEvent:e]) return nil;
+    return [super hitTest:p withEvent:e];
 }
 @end
 
@@ -388,12 +405,13 @@ static void mx_rebuild_overlay(void) {
 
     g_win = [[UIWindow alloc] initWithWindowScene:scn];
     g_win.frame = scn.coordinateSpace.bounds;
-    g_win.windowLevel = CGFLOAT_MAX;
+    g_win.windowLevel = 100000;   // v1.1: 不用 CGFLOAT_MAX，避开越界 level 的路由边界
     g_win.backgroundColor = UIColor.clearColor;
+    // v1.1: 保留空 rootVC（防 'expected root controller' 崩溃），但穿透视图直接 addSubview 到
+    // window —— 事件链更短，不经 rootViewController.view 的一层包装
+    g_win.rootViewController = [[UIViewController alloc] init];
     MXPassthroughView *root = [[MXPassthroughView alloc] initWithFrame:g_win.bounds];
     root.backgroundColor = UIColor.clearColor;
-    g_win.rootViewController = [[UIViewController alloc] init];
-    g_win.rootViewController.view = root;
 
     // 悬浮球（58pt，右侧安全区）
     CGFloat bs = 58;
@@ -419,9 +437,9 @@ static void mx_rebuild_overlay(void) {
     objc_setAssociatedObject(ball, "drag", @(1), OBJC_ASSOCIATION_RETAIN);
     [root addSubview:ball];
     g_ball = ball;
-    [g_win makeKeyAndVisible];
-    g_win.hidden = NO;
-    mlog(@"overlay window built (ball at %.0f,%.0f)", bx, by);
+    [g_win addSubview:root];      // v1.1: 直接挂 window
+    g_win.hidden = NO;            // v1.1: 不 makeKeyAndVisible（不抢 keyWindow，游戏键盘/输入路径不受干扰）
+    mlog(@"overlay window built (ball at %.0f,%.0f) level=100000 noKey", bx, by);
 }
 
 @implementation UIView (GLQXGestures)
