@@ -1,0 +1,45 @@
+name: build-glqx-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'GLQXCheat.m'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build GLQXCheat.dylib (arm64, no theos)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -Wall \
+            -o GLQXCheat.dylib \
+            GLQXCheat.m
+          file GLQXCheat.dylib
+          ls -la GLQXCheat.dylib
+
+      - name: Verify arm64 mach-o
+        run: |
+          vtool -show-build GLQXCheat.dylib || true
+          md5 GLQXCheat.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GLQXCheat.dylib
+          path: GLQXCheat.dylib
