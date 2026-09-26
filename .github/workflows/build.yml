@@ -30,7 +30,7 @@ jobs:
             -O2 \
             -Wall \
             -o GLQXCheat.dylib \
-            GLQXCheat.m
+            GLQXCheat.m fishhook.c
           file GLQXCheat.dylib
           ls -la GLQXCheat.dylib
 

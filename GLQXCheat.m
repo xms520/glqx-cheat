@@ -21,6 +21,9 @@
 #import <objc/message.h>
 #import <QuartzCore/QuartzCore.h>
 #import <unistd.h>
+#import <stdio.h>
+#import <string.h>
+#import "fishhook.h"
 
 static FILE *g_log = NULL;
 static void mlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -34,6 +37,31 @@ static void mlog(NSString *fmt, ...) {
         g_log = fopen(p.UTF8String, "a");
     }
     if (g_log) { fprintf(g_log, "[GLQX] %s\n", s.UTF8String); fflush(g_log); }
+}
+
+#pragma mark - v1.4: fopen 重定向（JS↔native 文件通道闭环）
+// LayaNative 的 fs_readFileSync/fs_writeFileSync 底层是纯 fopen，相对路径基于进程 cwd
+// （iOS 默认 "/"，不可写）。JS 侧读 glqx_flags.json / 写 glqx_js_probe.txt / glqx_js.log
+// 全部落到错误位置。这里用 fishhook 把这三个文件名的【相对路径】读写一律重定向到
+// Documents —— native 写 flags 到 Documents，JS 读必中；JS 写日志/探针 native 也必能扫到。
+static FILE *(*orig_fopen)(const char *, const char *);
+static FILE *my_fopen(const char *path, const char *mode) {
+    if (path && path[0] != '/') {
+        const char *slash = strrchr(path, '/');
+        const char *base = slash ? slash + 1 : path;
+        if (!strcmp(base, "glqx_flags.json") || !strcmp(base, "glqx_js_probe.txt") || !strcmp(base, "glqx_js.log")) {
+            static char s_doc[512];
+            if (!s_doc[0]) snprintf(s_doc, sizeof(s_doc), "%s/Documents", NSHomeDirectory().UTF8String);
+            char np[768];
+            snprintf(np, sizeof(np), "%s/%s", s_doc, base);
+            return orig_fopen(np, mode);
+        }
+    }
+    return orig_fopen(path, mode);
+}
+static void mx_install_fopen_hook(void) {
+    rebind_symbols((struct rebinding[1]){{"fopen", (void *)my_fopen, (void *)&orig_fopen}}, 1);
+    mlog(@"fopen redirect installed (glqx_* -> Documents)");
 }
 
 #pragma mark - 功能状态 + 文件同步
@@ -569,7 +597,8 @@ static void mx_keepalive_tick(void) {
 #pragma mark - ctor
 __attribute__((constructor))
 static void glqx_ctor(void) {
-    mlog(@"ctor: GLQXCheat v1.3 boot (pid=%d)", getpid());
+    mlog(@"ctor: GLQXCheat v1.4 boot (pid=%d)", getpid());
+    mx_install_fopen_hook();
     mx_install_hooks();
     sync_flags();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
