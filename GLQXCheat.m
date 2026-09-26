@@ -141,6 +141,7 @@ static UIImage *mx_avatar(void) {
 // 3) 兜底拦 window.eval（CDN index.js 若先执行则补 wrap）
 // bootstrap：最早注入（runJS: 全局上下文）；v1.3 + jlog/probe/readFlags 强化
 // bootstrap：最早注入（runJS: 全局上下文）；v1.3 + jlog/probe/readFlags 强化
+// bootstrap：最早注入（runJS: 全局上下文）；v1.3 + jlog/probe/readFlags 强化
 static NSString * const kBootJS = @"(function(){"
 @"if(window.__GLQX_BOOTED)return;window.__GLQX_BOOTED=1;"
 @"var w=window;w.__GLQX={kill:0,inv:0,spd:0,jlogs:[]};"
@@ -239,7 +240,9 @@ static NSString * const kBootJS = @"(function(){"
 
 
 
+
 // HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）
+// HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）；日志走 jlog（写文件）
 // HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）；日志走 jlog（写文件）
 // HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）；日志走 jlog（写文件）
 static NSString * const kHookJS =
@@ -305,15 +308,14 @@ static NSString * const kHookJS =
 @"};"
 @"w.__GLQX.isOur=isOur;w.__GLQX.calc=BC;w.__GLQX.common=CM;"
 @"lg('BattleCalc patched, leftPlayer='+(CM.leftPlayer?'1':'0'));"
-@"clearInterval(timer);"
 @"}"
 @"if(tries===10||tries===60||tries===240){"
 @"lg('waiting: BC='+(typeof BC)+' CM='+(typeof CM)+' inner='+!!w.__GLQX_PATCHED);"
 @"}"
-@"if(tries>2400)clearInterval(timer);"
 @"}catch(e){if(tries%100===0)lg('tick err '+e);}"
 @"},500);"
 @"})();";
+
 
 
 
@@ -597,7 +599,7 @@ static void mx_keepalive_tick(void) {
 #pragma mark - ctor
 __attribute__((constructor))
 static void glqx_ctor(void) {
-    mlog(@"ctor: GLQXCheat v1.4 boot (pid=%d)", getpid());
+    mlog(@"ctor: GLQXCheat v1.5 boot (pid=%d)", getpid());
     mx_install_fopen_hook();
     mx_install_hooks();
     sync_flags();

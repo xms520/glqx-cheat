@@ -62,12 +62,10 @@ static NSString * const kHookJS =
 @"};"
 @"w.__GLQX.isOur=isOur;w.__GLQX.calc=BC;w.__GLQX.common=CM;"
 @"lg('BattleCalc patched, leftPlayer='+(CM.leftPlayer?'1':'0'));"
-@"clearInterval(timer);"
 @"}"
 @"if(tries===10||tries===60||tries===240){"
 @"lg('waiting: BC='+(typeof BC)+' CM='+(typeof CM)+' inner='+!!w.__GLQX_PATCHED);"
 @"}"
-@"if(tries>2400)clearInterval(timer);"
 @"}catch(e){if(tries%100===0)lg('tick err '+e);}"
 @"},500);"
 @"})();";
