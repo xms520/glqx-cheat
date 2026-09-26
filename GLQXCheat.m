@@ -229,33 +229,6 @@ static void mx_install_hooks(void) {
     mlog(@"-[conchRuntime update] hooked");
 }
 
-#pragma mark - 触摸穿透根视图（v1.1: pointInside 底层拦截 + 自诊断）
-// 机制：window.hitTest 的第一步就是调 root 的 pointInside。
-// 这里只让"落在可交互子控件上"的点命中，其余一律 NO → window.hitTest 返回 nil →
-// 事件由 UIKit 继续分发给下层游戏 window（delegate.window）。比 hitTest==self 判断更底层、无语义差异。
-@interface MXPassthroughView : UIView
-@end
-@implementation MXPassthroughView
-- (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e {
-    static int s_dbg = 0;
-    BOOL hit = NO;
-    for (UIView *v in self.subviews) {
-        if (v.hidden || !v.userInteractionEnabled) continue;
-        CGPoint lp = [self convertPoint:p toView:v];
-        if ([v pointInside:lp withEvent:e]) { hit = YES; break; }
-    }
-    if (++s_dbg <= 25) {
-        mlog(@"pointInside(%.0f,%.0f) -> %@ (subs=%lu)", p.x, p.y, hit ? @"YES" : @"no", (unsigned long)self.subviews.count);
-    }
-    return hit;
-}
-- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    // pointInside=NO 时 UIKit 根本不会进到这里；此函数仅防越权子视图
-    if (![self pointInside:p withEvent:e]) return nil;
-    return [super hitTest:p withEvent:e];
-}
-@end
-
 #pragma mark - 彩虹环悬浮球
 static void mx_addRainbowRing(CALayer *parent, CGFloat inset) {
     CAGradientLayer *g = [CAGradientLayer layer];
@@ -387,37 +360,28 @@ static void mx_refreshButtons(void) {
 }
 @end
 
-#pragma mark - 独立 Overlay Window + 悬浮球
-static UIWindow *g_win = nil;
+#pragma mark - 悬浮球/面板挂载（v1.2：直接挂游戏 delegate.window，不建独立 UIWindow）
+// v1.0/v1.1 教训：LayaNative 是老式 AppDelegate lifecycle（无 Scene Delegate），自建
+// initWithWindowScene: 的 window 挂到 connectedScenes 的 scene 上——图层能显示（球可见）
+// 但事件路由不通（球点不了、pointInside 从未被调）。v1.2 直接把球 addSubview 到游戏
+// keyWindow 顶层：球仅 58pt 自身响应，其余区域无视图，事件直达游戏，不可能挡屏幕。
 static UIView *g_ball = nil;
 
-static void mx_rebuild_overlay(void) {
-    if (g_win && g_win.hidden == NO && g_win.windowScene != nil && g_win.rootViewController != nil) return;
-    mlog(@"overlay (re)building");
-    UIWindowScene *scn = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes)
-        if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { scn = (UIWindowScene *)s; break; }
-    if (!scn) {
-        for (UIScene *s in [UIApplication sharedApplication].connectedScenes)
-            if ([s isKindOfClass:[UIWindowScene class]]) { scn = (UIWindowScene *)s; break; }
+static UIWindow * mx_game_window(void) {
+    UIWindow *w = [UIApplication sharedApplication].delegate.window;
+    if (w) return w;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        for (UIWindow *ww in ws.windows) if (ww.isKeyWindow) return ww;
+        if (ws.windows.count) return ws.windows.firstObject;
     }
-    if (!scn) { mlog(@"no window scene yet"); g_win = nil; return; }
+    return nil;
+}
 
-    g_win = [[UIWindow alloc] initWithWindowScene:scn];
-    g_win.frame = scn.coordinateSpace.bounds;
-    g_win.windowLevel = 100000;   // v1.1: 不用 CGFLOAT_MAX，避开越界 level 的路由边界
-    g_win.backgroundColor = UIColor.clearColor;
-    // v1.1: 保留空 rootVC（防 'expected root controller' 崩溃），但穿透视图直接 addSubview 到
-    // window —— 事件链更短，不经 rootViewController.view 的一层包装
-    g_win.rootViewController = [[UIViewController alloc] init];
-    MXPassthroughView *root = [[MXPassthroughView alloc] initWithFrame:g_win.bounds];
-    root.backgroundColor = UIColor.clearColor;
-
-    // 悬浮球（58pt，右侧安全区）
+static UIView * mx_build_ball(void) {
     CGFloat bs = 58;
-    CGFloat bx = root.bounds.size.width - bs - 28;
-    CGFloat by = root.bounds.size.height * 0.42;
-    UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(bx, by, bs, bs)];
+    UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(0, 0, bs, bs)];
     ball.layer.cornerRadius = bs/2;
     ball.layer.masksToBounds = NO;
     ball.layer.shadowColor = UIColor.blackColor.CGColor;
@@ -435,11 +399,36 @@ static void mx_rebuild_overlay(void) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:ball action:@selector(mx_ballDrag:)];
     [ball addGestureRecognizer:pan];
     objc_setAssociatedObject(ball, "drag", @(1), OBJC_ASSOCIATION_RETAIN);
-    [root addSubview:ball];
-    g_ball = ball;
-    [g_win addSubview:root];      // v1.1: 直接挂 window
-    g_win.hidden = NO;            // v1.1: 不 makeKeyAndVisible（不抢 keyWindow，游戏键盘/输入路径不受干扰）
-    mlog(@"overlay window built (ball at %.0f,%.0f) level=100000 noKey", bx, by);
+    return ball;
+}
+
+// 确保球挂在游戏 window 顶层；被游戏盖住/换窗时自愈
+static void mx_ensure_overlay(void) {
+    UIWindow *w = mx_game_window();
+    if (!w) { static int s_w = 0; if (++s_w <= 5) mlog(@"game window not ready #%d", s_w); return; }
+    BOOL need = NO;
+    if (!g_ball) {
+        g_ball = mx_build_ball();
+        need = YES;
+    } else if (g_ball.superview != w) {
+        need = YES;
+    } else if (w.subviews.lastObject != g_ball) {
+        // 游戏在球之后加了视图（盖层）→ 顶到最前
+        [w bringSubviewToFront:g_ball];
+        static int s_b = 0; if (++s_b <= 5) mlog(@"ball brought to front #%d", s_b);
+    }
+    if (need) {
+        CGFloat bs = 58;
+        if (g_ball.frame.size.width < 1) g_ball.frame = CGRectMake(0, 0, bs, bs);
+        CGPoint old = g_ball.center;
+        CGRect scr = w.bounds;
+        if (old.x < 1 && old.y < 1) g_ball.center = CGPointMake(scr.size.width - 57, scr.size.height * 0.42);
+        [w addSubview:g_ball];
+        [w bringSubviewToFront:g_ball];
+        mlog(@"ball attached to game window (%.0fx%.0f) subviews=%lu", scr.size.width, scr.size.height, (unsigned long)w.subviews.count);
+    }
+    if (g_panel && g_panel.superview == w && w.subviews.lastObject != g_panel)
+        [w bringSubviewToFront:g_panel];
 }
 
 @implementation UIView (GLQXGestures)
@@ -455,29 +444,30 @@ static void mx_rebuild_overlay(void) {
     b.center = c;
 }
 - (void)mx_ballTap:(UITapGestureRecognizer *)p {
+    UIWindow *w = self.window;
+    if (!w) return;
     if (g_panel) {
         [g_panel removeFromSuperview];
         g_panel = nil;
         return;
     }
-    if (!g_win) return;
     CGFloat pw = 250, ph = 232;
-    CGRect scr = g_win.bounds;
+    CGRect scr = w.bounds;
     CGFloat px = self.center.x - pw/2;
     px = MAX(10, MIN(scr.size.width - pw - 10, px));
     CGFloat py = self.center.y + 70;
     py = MAX(10, MIN(scr.size.height - ph - 10, py));
     g_panel = [[MXBox alloc] initWithFrame:CGRectMake(px, py, pw, ph)];
-    [g_win addSubview:g_panel];
+    [w addSubview:g_panel];
+    [w bringSubviewToFront:g_panel];
+    mlog(@"panel opened at %.0f,%.0f", px, py);
 }
 @end
 
 #pragma mark - 保活 tick
 static void mx_keepalive_tick(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!g_win || g_win.hidden || g_win.rootViewController == nil || !g_ball.superview) {
-            mx_rebuild_overlay();
-        }
+        mx_ensure_overlay();
         static int s_cnt = 0;
         if (++s_cnt % 15 == 0) sync_flags();   // 30s 周期重写（防文件被清）
     });
@@ -486,11 +476,11 @@ static void mx_keepalive_tick(void) {
 #pragma mark - ctor
 __attribute__((constructor))
 static void glqx_ctor(void) {
-    mlog(@"ctor: GLQXCheat v1 boot (pid=%d)", getpid());
+    mlog(@"ctor: GLQXCheat v1.2 boot (pid=%d)", getpid());
     mx_install_hooks();
     sync_flags();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        mx_rebuild_overlay();
+        mx_ensure_overlay();
     });
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(0, 0));
     dispatch_source_set_timer(t, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
