@@ -20,6 +20,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <QuartzCore/QuartzCore.h>
+#import <unistd.h>
 
 static FILE *g_log = NULL;
 static void mlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -41,19 +42,52 @@ static int g_inv = 0;       // 无敌 0/1
 static int g_spdIdx = 0;    // 0=OFF 1=x2 2=x4 3=x8
 static const int kSpdVal[4] = {1, 2, 4, 8};
 
+static NSString *g_jsCachePath = nil;   // v1.3: 从 JS 探针解析出的真实 cache 路径
+static BOOL g_probeSeen = NO;
+
 static void sync_flags(void) {
     NSString *json = [NSString stringWithFormat:@"{\"kill\":%d,\"inv\":%d,\"spd\":%d}",
                       g_kill, g_inv, kSpdVal[g_spdIdx]];
     NSString *home = NSHomeDirectory();
-    NSArray *dirs = @[
+    NSMutableArray *dirs = [NSMutableArray arrayWithArray:@[
         [home stringByAppendingPathComponent:@"Documents"],
         [home stringByAppendingPathComponent:@"Library/Caches"],
         [home stringByAppendingPathComponent:@"Library/Preferences"],
-        [home stringByAppendingPathComponent:@"tmp"]];
+        [home stringByAppendingPathComponent:@"tmp"],
+        [NSString stringWithUTF8String:getcwd(NULL, 0) ?: "/"]]];
+    if (g_jsCachePath) [dirs addObject:g_jsCachePath];
     for (NSString *d in dirs)
         [json writeToFile:[d stringByAppendingPathComponent:@"glqx_flags.json"]
                atomically:YES encoding:NSUTF8StringEncoding error:nil];
     mlog(@"flags sync: %@", json);
+}
+
+// 读 JS 探针（glqx_js_probe.txt，内容含 cachePath=...）→ 得知 JS 侧真实可写路径
+static void mx_scan_probe(void) {
+    if (g_probeSeen) return;
+    NSString *home = NSHomeDirectory();
+    NSMutableArray *dirs = [NSMutableArray arrayWithArray:@[
+        [home stringByAppendingPathComponent:@"Documents"],
+        [home stringByAppendingPathComponent:@"Library/Caches"],
+        [home stringByAppendingPathComponent:@"tmp"],
+        [NSString stringWithUTF8String:getcwd(NULL, 0) ?: "/"]]];
+    for (NSString *d in dirs) {
+        NSString *p = [d stringByAppendingPathComponent:@"glqx_js_probe.txt"];
+        NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        if (!s) continue;
+        NSString *cp = nil;
+        for (NSString *line in [s componentsSeparatedByString:@"\n"])
+            if ([line hasPrefix:@"cachePath="]) cp = [line substringFromIndex:10];
+        if (cp.length) {
+            g_jsCachePath = cp;
+            mlog(@"js probe: cachePath=%@, resync flags", cp);
+        } else {
+            mlog(@"js probe found (no cachePath): %@", s);
+        }
+        g_probeSeen = YES;
+        sync_flags();   // 拿到 cachePath 后立即补写一份
+        return;
+    }
 }
 
 #pragma mark - 内嵌头像（base64 JPEG 256x256）
@@ -77,17 +111,56 @@ static UIImage *mx_avatar(void) {
 // bootstrap：最早注入（runJS: 全局上下文）
 // 1) 定义 readFlags  2) wrap window.loadLib（dcc 读源码→bundle插桩→eval）
 // 3) 兜底拦 window.eval（CDN index.js 若先执行则补 wrap）
+// bootstrap：最早注入（runJS: 全局上下文）；v1.3 + jlog/probe/readFlags 强化
 static NSString * const kBootJS = @"(function(){"
 @"if(window.__GLQX_BOOTED)return;window.__GLQX_BOOTED=1;"
-@"var w=window;w.__GLQX={kill:0,inv:0,spd:0};"
+@"var w=window;w.__GLQX={kill:0,inv:0,spd:0,jlogs:[]};"
+@"function CP(){try{return (typeof conch!=='undefined'&&conch&&conch.getCachePath)?conch.getCachePath():'';}catch(e){return '';}}"
+@"w.__GLQX.jlog=function(m){"
+@"try{"
+@"w.__GLQX.jlogs.push('['+((Date.now()/1000)%1000).toFixed(1)+'] '+m);"
+@"if(w.__GLQX.jlogs.length>150)w.__GLQX.jlogs.shift();"
+@"var txt=w.__GLQX.jlogs.join('\n');"
+@"var ps=['glqx_js.log'];"
+@"var cp=CP();if(cp)ps.push(cp+'/glqx_js.log');"
+@"for(var i=0;i<ps.length;i++){try{fs_writeFileSync(ps[i],txt);return;}catch(e){}}"
+@"}catch(e){}"
+@"};"
+@"var J=w.__GLQX.jlog;"
+@"function toStr(v){"
+@"if(v==null)return null;"
+@"if(typeof v==='string')return v;"
+@"try{return new TextDecoder('utf8').decode(v);}catch(e){}"
+@"try{var u8=new Uint8Array(v),o=[],i=0;"
+@"while(i<u8.length){var c=u8[i];"
+@"if(c<128){o.push(String.fromCharCode(c));i++;}"
+@"else if(c<224){o.push(String.fromCharCode(((c&31)<<6)|(u8[i+1]&63)));i+=2;}"
+@"else{o.push(String.fromCharCode(((c&15)<<12)|((u8[i+1]&63)<<6)|(u8[i+2]&63)));i+=3;}}"
+@"return o.join('');}catch(e){return null;}"
+@"}"
+@"w.__GLQX.toStr=toStr;"
 @"w.__GLQX.readFlags=function(){"
 @"var ns=['glqx_flags.json'];"
-@"try{var cp=(typeof conch!=='undefined'&&conch&&conch.getCachePath)?conch.getCachePath():'';"
-@"if(cp)ns.push(cp+'/glqx_flags.json');}catch(e){}"
+@"var cp=CP();if(cp){ns.push(cp+'/glqx_flags.json');ns.push(cp+'/../Documents/glqx_flags.json');ns.push(cp+'/../../Documents/glqx_flags.json');}"
+@"ns.push('Documents/glqx_flags.json');ns.push('Library/Caches/glqx_flags.json');ns.push('tmp/glqx_flags.json');"
 @"for(var i=0;i<ns.length;i++){"
-@"try{var s=fs_readFileSync(ns[i],'utf8');"
-@"if(s&&s.length>2)return s;}catch(e){}}"
-@"return null;};"
+@"try{var raw=null;"
+@"if(typeof fs_readFileSync==='function')raw=fs_readFileSync(ns[i],'utf8');"
+@"else if(typeof readFileSync==='function')raw=readFileSync(ns[i],'utf8');"
+@"var s=toStr(raw);"
+@"if(s&&s.length>2&&s.indexOf('{')>=0)return s;"
+@"}catch(e){}}"
+@"return null;"
+@"};"
+@"function probe(){"
+@"var info='';"
+@"info+='cachePath='+CP()+'\n';"
+@"try{info+='exePath='+getExePath()+'\n';}catch(e){info+='exePath=ERR\n';}"
+@"info+='fs_read='+(typeof fs_readFileSync)+' read='+(typeof readFileSync)+' fs_write='+(typeof fs_writeFileSync)+' wstr='+(typeof writeStrFileSync)+'\n';"
+@"var ps=['glqx_js_probe.txt'];var cp=CP();if(cp)ps.push(cp+'/glqx_js_probe.txt');"
+@"for(var i=0;i<ps.length;i++){try{fs_writeFileSync(ps[i],info);}catch(e){}}"
+@"J('probe: '+info.replace(/\n/g,' | '));"
+@"}"
 @"function wrapLoad(){"
 @"if(w.__GLQX_WRAPPED)return;w.__GLQX_WRAPPED=1;"
 @"var orig=w.loadLib;w.__GLQX_ORIG=orig;"
@@ -112,16 +185,19 @@ static NSString * const kBootJS = @"(function(){"
 @"try{txt=new TextDecoder('utf8').decode(buf);}catch(e){"
 @"txt=dec(new Uint8Array(buf));}}"
 @"if(url.indexOf('js/bundle')>=0&&txt.indexOf('BattleCalc')>=0&&txt.indexOf('__GLQX_HOOKED')<0){"
-@"txt=txt.replace('\"use strict\";(()=>{','\"use strict\";(()=>{'+w.__GLQX_HOOK_SRC+';var __GLQX_HOOKED=1;');}"
-@"w.eval(txt+'\\n//@ sourceURL='+url);"
-@"console.log('[GLQX] lib ok '+url);"
-@"}).catch(function(e){"
-@"console.log('[GLQX] read fail '+url+' '+e);"
-@"orig(url);});"
-@"}catch(e){console.log('[GLQX] loadLib err '+e);try{orig(url);}catch(_){}}};"
-@"w.loadLib=fn;"
-@"console.log('[GLQX] loadLib wrapped');"
+@"txt=txt.replace('\"use strict\";(()=>{','\"use strict\";(()=>{'+w.__GLQX_HOOK_SRC+';var __GLQX_HOOKED=1;');"
+@"J('bundle instrumented, len='+txt.length);"
 @"}"
+@"w.eval(txt+'\n//@ sourceURL='+url);"
+@"J('lib ok '+url);"
+@"}).catch(function(e){"
+@"J('read fail '+url+' '+e);"
+@"orig(url);});"
+@"}catch(e){J('loadLib err '+e);try{orig(url);}catch(_){}}};"
+@"w.loadLib=fn;"
+@"J('loadLib wrapped');"
+@"}"
+@"probe();"
 @"wrapLoad();"
 @"var oe=w.eval;"
 @"w.eval=function(code){"
@@ -129,15 +205,17 @@ static NSString * const kBootJS = @"(function(){"
 @"if(typeof code==='string'&&code.indexOf('loadLib(')>=0&&code.length<40000&&!w.__GLQX_WRAPPED){wrapLoad();}"
 @"}catch(e){}"
 @"return oe.call(w,code);};"
-@"console.log('[GLQX] bootstrap ok');"
+@"J('bootstrap ok');"
 @"})();";
 
+
 // HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）
+// HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）；日志走 jlog（写文件）
 static NSString * const kHookJS =
 @";(function(){"
 @"if(window.__GLQX_INNER)return;window.__GLQX_INNER=1;"
 @"var w=window;"
-@"function lg(m){try{console.log('[GLQX] '+m);}catch(e){}}"
+@"function lg(m){try{console.log('[GLQX] '+m);}catch(e){}try{w.__GLQX&&w.__GLQX.jlog&&w.__GLQX.jlog(m);}catch(e){}}"
 @"var tries=0;"
 @"var timer=setInterval(function(){"
 @"tries++;"
@@ -147,12 +225,18 @@ static NSString * const kHookJS =
 @"((typeof BattleCommon_default!=='undefined'&&BattleCommon_default)?BattleCommon_default:null);"
 @"var BC=(typeof BattleCalc!=='undefined')?BattleCalc:null;"
 @"if(tries%2===0){"
-@"try{"
-@"var s=(w.__GLQX&&w.__GLQX.readFlags)?w.__GLQX.readFlags():null;"
-@"if(s){var o=JSON.parse(s);"
-@"w.__GLQX.kill=o.kill|0;w.__GLQX.inv=o.inv|0;w.__GLQX.spd=o.spd|0;}"
-@"}catch(e){}"
-@"if(CM&&w.__GLQX&&w.__GLQX.spd>1){"
+@"var s=null;"
+@"try{s=(w.__GLQX&&w.__GLQX.readFlags)?w.__GLQX.readFlags():null;}catch(e){}"
+@"if(s){"
+@"try{var o=JSON.parse(s);"
+@"var nk=o.kill|0,ni=o.inv|0,nsp=o.spd|0;"
+@"if(nk!==w.__GLQX.kill||ni!==w.__GLQX.inv||nsp!==w.__GLQX.spd){"
+@"w.__GLQX.kill=nk;w.__GLQX.inv=ni;w.__GLQX.spd=nsp;"
+@"lg('flags applied k='+nk+' i='+ni+' s='+nsp);"
+@"}"
+@"}catch(e){lg('flags parse err '+e);}"
+@"}else if(tries===2||tries===20){lg('readFlags empty t='+tries);}"
+@"if(CM&&w.__GLQX.spd>1){"
 @"try{if(CM.battleTimeScale!==w.__GLQX.spd){CM.battleTimeScale=w.__GLQX.spd;lg('timeScale='+w.__GLQX.spd);}}catch(e){}"
 @"}"
 @"}"
@@ -167,7 +251,7 @@ static NSString * const kHookJS =
 @"if(u.player===lp)return true;"
 @"if(u.getPlayer&&u.getPlayer()===lp)return true;"
 @"if(u.playerUserId!=null&&lp.uuid!=null&&u.playerUserId===lp.uuid)return true;"
-@"return false;"
+@"return false"
 @"}catch(e){return false;}"
 @"}"
 @"var oCal=BC.calDamage;"
@@ -192,10 +276,14 @@ static NSString * const kHookJS =
 @"lg('BattleCalc patched, leftPlayer='+(CM.leftPlayer?'1':'0'));"
 @"clearInterval(timer);"
 @"}"
+@"if(tries===10||tries===60||tries===240){"
+@"lg('waiting: BC='+(typeof BC)+' CM='+(typeof CM)+' inner='+!!w.__GLQX_PATCHED);"
+@"}"
 @"if(tries>2400)clearInterval(timer);"
 @"}catch(e){if(tries%100===0)lg('tick err '+e);}"
 @"},500);"
 @"})();";
+
 
 #pragma mark - conchRuntime hook（手写 swizzle，零依赖）
 static int g_updateTicks = 0;
@@ -467,6 +555,7 @@ static void mx_ensure_overlay(void) {
 #pragma mark - 保活 tick
 static void mx_keepalive_tick(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        mx_scan_probe();          // v1.3: 找 JS 探针 → cachePath → flags 同步路径闭环
         mx_ensure_overlay();
         static int s_cnt = 0;
         if (++s_cnt % 15 == 0) sync_flags();   // 30s 周期重写（防文件被清）
@@ -476,7 +565,7 @@ static void mx_keepalive_tick(void) {
 #pragma mark - ctor
 __attribute__((constructor))
 static void glqx_ctor(void) {
-    mlog(@"ctor: GLQXCheat v1.2 boot (pid=%d)", getpid());
+    mlog(@"ctor: GLQXCheat v1.3 boot (pid=%d)", getpid());
     mx_install_hooks();
     sync_flags();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
