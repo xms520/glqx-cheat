@@ -112,6 +112,7 @@ static UIImage *mx_avatar(void) {
 // 1) 定义 readFlags  2) wrap window.loadLib（dcc 读源码→bundle插桩→eval）
 // 3) 兜底拦 window.eval（CDN index.js 若先执行则补 wrap）
 // bootstrap：最早注入（runJS: 全局上下文）；v1.3 + jlog/probe/readFlags 强化
+// bootstrap：最早注入（runJS: 全局上下文）；v1.3 + jlog/probe/readFlags 强化
 static NSString * const kBootJS = @"(function(){"
 @"if(window.__GLQX_BOOTED)return;window.__GLQX_BOOTED=1;"
 @"var w=window;w.__GLQX={kill:0,inv:0,spd:0,jlogs:[]};"
@@ -120,7 +121,7 @@ static NSString * const kBootJS = @"(function(){"
 @"try{"
 @"w.__GLQX.jlogs.push('['+((Date.now()/1000)%1000).toFixed(1)+'] '+m);"
 @"if(w.__GLQX.jlogs.length>150)w.__GLQX.jlogs.shift();"
-@"var txt=w.__GLQX.jlogs.join('\n');"
+@"var txt=w.__GLQX.jlogs.join('\\n');"
 @"var ps=['glqx_js.log'];"
 @"var cp=CP();if(cp)ps.push(cp+'/glqx_js.log');"
 @"for(var i=0;i<ps.length;i++){try{fs_writeFileSync(ps[i],txt);return;}catch(e){}}"
@@ -154,12 +155,12 @@ static NSString * const kBootJS = @"(function(){"
 @"};"
 @"function probe(){"
 @"var info='';"
-@"info+='cachePath='+CP()+'\n';"
-@"try{info+='exePath='+getExePath()+'\n';}catch(e){info+='exePath=ERR\n';}"
-@"info+='fs_read='+(typeof fs_readFileSync)+' read='+(typeof readFileSync)+' fs_write='+(typeof fs_writeFileSync)+' wstr='+(typeof writeStrFileSync)+'\n';"
+@"info+='cachePath='+CP()+'\\n';"
+@"try{info+='exePath='+getExePath()+'\\n';}catch(e){info+='exePath=ERR\\n';}"
+@"info+='fs_read='+(typeof fs_readFileSync)+' read='+(typeof readFileSync)+' fs_write='+(typeof fs_writeFileSync)+' wstr='+(typeof writeStrFileSync)+'\\n';"
 @"var ps=['glqx_js_probe.txt'];var cp=CP();if(cp)ps.push(cp+'/glqx_js_probe.txt');"
 @"for(var i=0;i<ps.length;i++){try{fs_writeFileSync(ps[i],info);}catch(e){}}"
-@"J('probe: '+info.replace(/\n/g,' | '));"
+@"J('probe: '+info.replace(/\\n/g,' | '));"
 @"}"
 @"function wrapLoad(){"
 @"if(w.__GLQX_WRAPPED)return;w.__GLQX_WRAPPED=1;"
@@ -188,7 +189,7 @@ static NSString * const kBootJS = @"(function(){"
 @"txt=txt.replace('\"use strict\";(()=>{','\"use strict\";(()=>{'+w.__GLQX_HOOK_SRC+';var __GLQX_HOOKED=1;');"
 @"J('bundle instrumented, len='+txt.length);"
 @"}"
-@"w.eval(txt+'\n//@ sourceURL='+url);"
+@"w.eval(txt+'\\n//@ sourceURL='+url);"
 @"J('lib ok '+url);"
 @"}).catch(function(e){"
 @"J('read fail '+url+' '+e);"
@@ -209,7 +210,9 @@ static NSString * const kBootJS = @"(function(){"
 @"})();";
 
 
+
 // HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）
+// HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）；日志走 jlog（写文件）
 // HOOK_SRC：插入 bundle IIFE 内部（可访问 esbuild 顶层 var）；日志走 jlog（写文件）
 static NSString * const kHookJS =
 @";(function(){"
@@ -283,6 +286,7 @@ static NSString * const kHookJS =
 @"}catch(e){if(tries%100===0)lg('tick err '+e);}"
 @"},500);"
 @"})();";
+
 
 
 #pragma mark - conchRuntime hook（手写 swizzle，零依赖）

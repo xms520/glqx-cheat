@@ -57,6 +57,35 @@ def balance(code):
 print('boot balance:', balance(bootjs))
 print('hook balance:', balance(hookjs))
 
+def str_newline_check(code):
+    """字符串/正则字面量内出现真实换行 = ObjC 转义 bug"""
+    in_str = None
+    i = 0
+    while i < len(code):
+        c = code[i]
+        if in_str:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '\n':
+                return 'REAL NEWLINE inside %s literal at %d: ...%s...' % (in_str, i, code[max(0, i-50):i+5])
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c in '\'"':
+            in_str = c
+        elif c == '/' and i+1 < len(code) and code[i+1] != '/' and code[i+1] != '*':
+            # 可能是正则字面量（简化：无法精确判断，跳过）
+            pass
+        i += 1
+    if in_str:
+        return 'unterminated %s literal' % in_str
+    return 'OK'
+
+print('boot str-newline:', str_newline_check(bootjs))
+print('hook str-newline:', str_newline_check(hookjs))
+
 for k in ['use strict";(()=>{', '__GLQX_HOOK_SRC', 'fs_readFileSync', 'dcc.readFile',
           'loadLib wrapped', 'bootstrap ok']:
     assert k in bootjs, k
